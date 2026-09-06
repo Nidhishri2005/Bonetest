@@ -71,7 +71,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, required=True, help="Path to RSNA dataset")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--warmup-epochs", type=int, default=3, help="Epochs to train head with frozen backbone")
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=0,
+        help="Epochs to train head with frozen backbone (default: 0, no warmup)",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -229,6 +234,7 @@ def main() -> None:
     print(f"Training Model: {args.model_type}")
     print(f"Backbone:       {args.backbone}")
     print(f"Device:         {device}")
+    print(f"Warmup epochs:  {args.warmup_epochs}")
     print(f"Normalize tgt:  {args.normalize_target}")
     print(f"Pretrained:     {args.pretrained}")
     print(f"Loss function:  {args.loss}")
@@ -360,12 +366,12 @@ def main() -> None:
     best_ckpt_path = args.checkpoints_dir / f"{args.model_type}_best.pth"
 
     # -------------------------------------------------------------
-    # TWO-PHASE TRAINING SCHEDULE
+    # TRAINING SCHEDULE
     # -------------------------------------------------------------
-    # Phase 1: Warmup head with frozen backbone
-    warmup_epochs = min(args.warmup_epochs, args.epochs // 4)
+    warmup_epochs = max(0, args.warmup_epochs)
     backbone_module = getattr(model, "backbone", getattr(model, "image_backbone", None))
 
+    # Phase 1: Warmup head with frozen backbone (only if warmup_epochs > 0)
     if warmup_epochs > 0 and backbone_module is not None:
         print(f"\n--- Phase 1: Warming up head for {warmup_epochs} epochs (backbone frozen) ---")
         for param in backbone_module.parameters():
@@ -399,8 +405,12 @@ def main() -> None:
                 }, best_ckpt_path)
                 print(f"  * Saved new best checkpoint with Val MAE = {v_mae:.2f} months")
 
-    # Phase 2: Full fine-tuning with differential learning rates
-    print("\n--- Phase 2: Full End-to-End Fine-Tuning (differential LR) ---")
+    # End-to-End Fine-Tuning
+    if warmup_epochs > 0:
+        print("\n--- Phase 2: Full End-to-End Fine-Tuning (differential LR) ---")
+    else:
+        print("\n--- Full End-to-End Training (all layers active) ---")
+
     if backbone_module is not None:
         for param in backbone_module.parameters():
             param.requires_grad = True
@@ -422,7 +432,7 @@ def main() -> None:
         val_loss, val_mae, val_mse, val_rmse, val_r2 = validate(
             model, val_loader, criterion, device, args.model_type, target_mean, target_std
         )
-        
+
         old_lr = optimizer.param_groups[-1]["lr"]
         scheduler.step(val_mae)
         new_lr = optimizer.param_groups[-1]["lr"]
