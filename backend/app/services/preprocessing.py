@@ -56,6 +56,7 @@ def preprocess_for_inference(
     settings: Settings | None = None,
 ) -> Tuple[torch.Tensor, NDArray[np.uint8]]:
     """Return (1,1,H,W) tensor and original grayscale for overlay."""
+    """Return (1,1,H,W) tensor and letterbox canvas (H,W) for exact Grad-CAM overlay."""
     settings = settings or get_settings()
     raw = bytes_to_grayscale(image_bytes)
     original_display = raw.copy()
@@ -63,6 +64,7 @@ def preprocess_for_inference(
     normalized = normalize_image(resized)
     tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0).float()
     return tensor, original_display
+    return tensor, resized
 
 
 def tensor_to_display_image(tensor: torch.Tensor) -> NDArray[np.uint8]:

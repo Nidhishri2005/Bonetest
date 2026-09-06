@@ -20,6 +20,7 @@ class ModelRegistry:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._models: Dict[str, Any] = {}
+        self._target_scalers: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
         self._device = torch.device(
             self.settings.device
             if torch.cuda.is_available() or self.settings.device == "cpu"
@@ -44,6 +45,9 @@ class ModelRegistry:
         if model_type == "cnn_rf" and not self.rf_path().exists():
             return False
         return True
+
+    def get_target_scaler(self, model_type: str) -> Tuple[Optional[float], Optional[float]]:
+        return self._target_scalers.get(model_type, (None, None))
 
     def list_models(self) -> list[dict]:
         result = []
@@ -79,10 +83,33 @@ class ModelRegistry:
         model = model_class(pretrained=False)
 
         checkpoint = torch.load(ckpt_path, map_location=self._device, weights_only=False)
+        backbone = checkpoint.get("backbone", "resnet18")
+
+        try:
+            model = model_class(pretrained=False, backbone_name=backbone)
+        except TypeError:
+            model = model_class(pretrained=False)
+
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state_dict, strict=False)
         model.to(self._device)
         model.eval()
+
+        target_mean = checkpoint.get("target_mean", None)
+        target_std = checkpoint.get("target_std", None)
+
+        if target_mean is None:
+            norm_json = self.settings.checkpoint_dir / "normalization.json"
+            if norm_json.exists():
+                try:
+                    with open(norm_json) as f:
+                        stats = json.load(f)
+                    target_mean = stats.get("target_mean")
+                    target_std = stats.get("target_std")
+                except Exception:
+                    pass
+
+        self._target_scalers[model_type] = (target_mean, target_std)
 
         if model_type == "cnn_rf":
             rf_path = self.rf_path()
@@ -90,6 +117,7 @@ class ModelRegistry:
                 raise FileNotFoundError(f"Random Forest model not found at {rf_path}")
             rf_model = joblib.load(rf_path)
             wrapper = CNNWithRFWrapper(model, rf_model)
+            wrapper = CNNWithRFWrapper(model, rf_model, target_mean=target_mean, target_std=target_std)
             self._models[model_type] = wrapper
             logger.info("Loaded model: %s (CNN + RF)", model_type)
             return wrapper

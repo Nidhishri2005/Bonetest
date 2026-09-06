@@ -4,34 +4,70 @@
       {
         "model_type": "cnn",
         "display_name": "CNN Baseline",
-        "metrics": { "mae": 8.42, "mse": 98.76, "rmse": 9.94 },
-        "num_samples": 1425
+        "metrics": {
+          "mae": 11.16,
+          "mse": 216.54,
+          "rmse": 14.72,
+          "r2": 0.8698,
+          "pearson": 0.9364,
+          "mae_years": 0.93,
+          "mae_male": 11.54,
+          "mae_female": 10.69
+        },
+        "num_samples": 1892
       },
       {
         "model_type": "cnn_dnn",
         "display_name": "CNN + DNN",
-        "metrics": { "mae": 7.89, "mse": 86.54, "rmse": 9.30 },
-        "num_samples": 1425
+        "metrics": {
+          "mae": 11.98,
+          "mse": 244.04,
+          "rmse": 15.62,
+          "r2": 0.8532,
+          "pearson": 0.9241,
+          "mae_years": 1.0,
+          "mae_male": 12.11,
+          "mae_female": 11.81
+        },
+        "num_samples": 1892
       },
       {
         "model_type": "multimodal_cnn",
         "display_name": "Multimodal CNN",
-        "metrics": { "mae": 7.15, "mse": 72.18, "rmse": 8.49 },
-        "num_samples": 1425
+        "metrics": {
+          "mae": 11.35,
+          "mse": 219.84,
+          "rmse": 14.83,
+          "r2": 0.8678,
+          "pearson": 0.9328,
+          "mae_years": 0.95,
+          "mae_male": 11.15,
+          "mae_female": 11.58
+        },
+        "num_samples": 1892
       },
       {
         "model_type": "cnn_rf",
         "display_name": "CNN + Random Forest",
-        "metrics": { "mae": 8.01, "mse": 89.32, "rmse": 9.45 },
-        "num_samples": 1425
+        "metrics": {
+          "mae": 14.42,
+          "mse": 324.23,
+          "rmse": 18.01,
+          "r2": 0.805,
+          "pearson": 0.9248,
+          "mae_years": 1.2,
+          "mae_male": 16.03,
+          "mae_female": 12.43
+        },
+        "num_samples": 1892
       }
     ],
-    "best_model": "multimodal_cnn",
-    "generated_at": "2024-01-15T12:00:00+00:00"
+    "best_model": "cnn",
+    "generated_at": "2026-09-06T03:28:14.432086+00:00"
   },
   "plots": {
-    "metrics_comparison": "metrics/plots/metrics_comparison.png",
-    "scatter_comparison": "metrics/plots/scatter_comparison.png"
+    "metrics_comparison": "C:\\Users\\shara\\Bonetest\\Bonetest-New\\backend\\metrics\\plots\\metrics_comparison.png",
+    "scatter_comparison": "C:\\Users\\shara\\Bonetest\\Bonetest-New\\backend\\metrics\\plots\\scatter_comparison.png"
   },
   "details": {
     "dataset": "RSNA Pediatric Bone Age",

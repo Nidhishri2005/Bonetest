@@ -115,6 +115,12 @@ class GradCamService:
         resized_display = cv2.resize(
             display, (tensor.shape[3], tensor.shape[2])
         )
+        if display.shape[:2] != (tensor.shape[2], tensor.shape[3]):
+            resized_display = cv2.resize(
+                display, (tensor.shape[3], tensor.shape[2])
+            )
+        else:
+            resized_display = display
         overlay = overlay_heatmap(resized_display, heatmap)
         heatmap_color = cv2.applyColorMap(
             (heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET

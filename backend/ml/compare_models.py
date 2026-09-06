@@ -23,12 +23,18 @@ def main() -> None:
 
     rows = []
     for model in data["comparison"]["models"]:
+        m = model["metrics"]
         rows.append(
             {
                 "Model": model["display_name"],
                 "MAE (months)": round(model["metrics"]["mae"], 2),
                 "MSE": round(model["metrics"]["mse"], 2),
                 "RMSE (months)": round(model["metrics"]["rmse"], 2),
+                "MAE (months)": round(m["mae"], 2),
+                "RMSE (months)": round(m["rmse"], 2),
+                "R²": round(m.get("r2", 0.0), 4),
+                "Pearson r": round(m.get("pearson", 0.0), 4),
+                "MAE (years)": round(m.get("mae_years", m["mae"] / 12.0), 2),
                 "Samples": model["num_samples"],
             }
         )

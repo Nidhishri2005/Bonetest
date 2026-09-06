@@ -8,6 +8,7 @@ MODEL_REGISTRY = {
         "class": CNNBaseline,
         "display_name": "CNN Baseline",
         "description": "ResNet-18 backbone with linear regression head",
+        "description": "ResNet backbone with linear regression head",
         "requires_gender": False,
         "supports_gradcam": True,
     },
@@ -15,6 +16,7 @@ MODEL_REGISTRY = {
         "class": CNNDNN,
         "display_name": "CNN + DNN",
         "description": "ResNet-18 with multi-layer dense regression head",
+        "description": "ResNet with multi-layer dense regression head",
         "requires_gender": False,
         "supports_gradcam": True,
     },
@@ -31,6 +33,7 @@ MODEL_REGISTRY = {
         "description": "CNN feature extractor with sklearn RF regressor",
         "requires_gender": False,
         "supports_gradcam": True,
+        "supports_gradcam": False,
         "wrapper": CNNWithRFWrapper,
     },
 }

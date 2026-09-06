@@ -8,10 +8,21 @@ from app.models.cnn import _adapt_resnet_input_conv
 class MultimodalCNN(nn.Module):
     """Model C: Image CNN branch fused with gender metadata."""
 
-    def __init__(self, pretrained: bool = False, meta_dim: int = 1) -> None:
+    def __init__(
+        self,
+        pretrained: bool = False,
+        meta_dim: int = 1,
+        backbone_name: str = "resnet18",
+    ) -> None:
         super().__init__()
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        backbone = models.resnet18(weights=weights)
+        self.backbone_name = backbone_name
+        if backbone_name == "resnet50":
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            backbone = models.resnet50(weights=weights)
+        else:
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            backbone = models.resnet18(weights=weights)
+
         _adapt_resnet_input_conv(backbone)
         self.feature_dim = backbone.fc.in_features
         backbone.fc = nn.Identity()
@@ -29,11 +40,11 @@ class MultimodalCNN(nn.Module):
             nn.Linear(fusion_in, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
+            nn.Dropout(0.25),
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            nn.Dropout(0.15),
             nn.Linear(128, 1),
         )
 
@@ -55,4 +66,4 @@ class MultimodalCNN(nn.Module):
         return self.fusion_head(fused).squeeze(-1)
 
     def get_gradcam_target_layer(self) -> nn.Module:
-        return self.image_backbone.layer4[-1].conv2
+        return self.image_backbone.layer4[-1]

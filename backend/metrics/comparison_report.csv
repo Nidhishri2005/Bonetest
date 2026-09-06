@@ -1,0 +1,5 @@
+Model,MAE (months),MSE,RMSE (months),R²,Pearson r,MAE (years),Samples
+CNN Baseline,11.16,216.54,14.72,0.8698,0.9364,0.93,1892
+Multimodal CNN,11.35,219.84,14.83,0.8678,0.9328,0.95,1892
+CNN + DNN,11.98,244.04,15.62,0.8532,0.9241,1.0,1892
+CNN + Random Forest,14.42,324.23,18.01,0.805,0.9248,1.2,1892

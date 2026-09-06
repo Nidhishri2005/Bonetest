@@ -1,6 +1,6 @@
 """Training script for all bone age models.
 
-Usage (Kaggle/Colab/local GPU):
+Usage:
     cd backend
     python -m ml.train --model-type cnn --data-dir /path/to/rsna --epochs 30
 """
@@ -8,11 +8,14 @@ Usage (Kaggle/Colab/local GPU):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import random
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-import time 
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,11 +25,22 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.models import MODEL_REGISTRY
-from app.models.cnn_rf import CNNFeatureExtractor
+from app.models import MODEL_REGISTRY, SUPPORTED_MODELS
+from app.models.cnn_rf import CNNFeatureExtractor, CNNWithRFWrapper
 from ml.augmentation import TrainAugmentation
 from ml.dataset import create_dataloaders
 from ml.preprocessing import compute_dataset_statistics, save_normalization_stats
+
+
+def set_seed(seed: int = 42) -> None:
+    """Ensure reproducibility across runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,44 +50,73 @@ def parse_args() -> argparse.Namespace:
         choices=["cnn", "cnn_dnn", "multimodal_cnn", "cnn_rf"],
         required=True,
     )
-    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument(
+        "--backbone",
+        choices=["resnet18", "resnet50"],
+        default="resnet18",
+        help="Backbone architecture",
+    )
+    parser.add_argument("--data-dir", type=Path, required=True, help="Path to RSNA dataset")
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--warmup-epochs", type=int, default=3, help="Epochs to train head with frozen backbone")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=7)
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument(
-        "--checkpoints-dir", type=Path, default=BACKEND_ROOT / "checkpoints"
+        "--loss",
+        choices=["smooth_l1", "l1", "mse"],
+        default="smooth_l1",
+        help="Loss function",
     )
-    parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument(
+        "--normalize-target",
+        action="store_true",
+        default=True,
+        help="Standardize target to N(0,1) during training",
+    )
+    parser.add_argument(
+        "--no-normalize-target",
+        action="store_false",
+        dest="normalize_target",
+        help="Train directly on raw months",
+    )
+    parser.add_argument("--pretrained", action="store_true", default=True, help="Use ImageNet pretrained weights")
+    parser.add_argument("--no-pretrained", action="store_false", dest="pretrained")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoints-dir", type=Path, default=BACKEND_ROOT / "checkpoints")
+    parser.add_argument("--metrics-dir", type=Path, default=BACKEND_ROOT / "metrics")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--cnn-checkpoint",
         type=Path,
         default=None,
-        help="Path to a pretrained CNN checkpoint",
+        help="Path to pretrained CNN checkpoint for downstream heads",
     )
     return parser.parse_args()
+
+
+def get_loss_function(loss_name: str) -> nn.Module:
+    if loss_name == "l1":
+        return nn.L1Loss()
+    elif loss_name == "mse":
+        return nn.MSELoss()
+    return nn.SmoothL1Loss()
 
 
 def train_epoch(model, loader, optimizer, criterion, device, model_type, scaler):
     model.train()
     total_loss = 0.0
-
     num_batches = len(loader)
 
     for batch_idx, batch in enumerate(loader):
-
-        if batch_idx % 50 == 0:
-            print(f"Training batch {batch_idx+1}/{num_batches}")
-
         images = batch["image"].to(device)
-        targets = batch["bone_age"].to(device)
+        targets = batch["target"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=device.type == "cuda"):
-
             if model_type == "multimodal_cnn":
                 gender = batch["male"].unsqueeze(-1).to(device)
                 outputs = model(images, gender)
@@ -88,17 +131,22 @@ def train_epoch(model, loader, optimizer, criterion, device, model_type, scaler)
 
         total_loss += loss.item() * images.size(0)
 
+        if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == num_batches:
+            print(f"  Batch {batch_idx + 1}/{num_batches} -- loss: {loss.item():.4f}")
+
     return total_loss / len(loader.dataset)
 
+
 @torch.no_grad()
-def validate(model, loader, criterion, device, model_type):
+def validate(model, loader, criterion, device, model_type, target_mean=None, target_std=None):
     model.eval()
     total_loss = 0.0
     preds, targets = [], []
 
     for batch in loader:
         images = batch["image"].to(device)
-        y = batch["bone_age"].to(device)
+        ground_truth = batch["bone_age"].to(device)
+        targets_loss = batch["target"].to(device)
 
         if model_type == "multimodal_cnn":
             gender = batch["male"].unsqueeze(-1).to(device)
@@ -106,483 +154,299 @@ def validate(model, loader, criterion, device, model_type):
         else:
             outputs = model(images)
 
-        loss = criterion(outputs, y)
+        loss = criterion(outputs, targets_loss)
         total_loss += loss.item() * images.size(0)
-        preds.extend(outputs.cpu().numpy().tolist())
-        targets.extend(y.cpu().numpy().tolist())
+
+        # INVERSE TRANSFORM PREDICTIONS TO MONTHS BEFORE CALCULATING CLINICAL METRICS
+        if target_mean is not None and target_std is not None:
+            pred_months = outputs * target_std + target_mean
+        else:
+            pred_months = outputs
+
+        preds.extend(pred_months.cpu().numpy().tolist())
+        targets.extend(ground_truth.cpu().numpy().tolist())
 
     preds_arr = np.array(preds)
     targets_arr = np.array(targets)
     mae = float(np.mean(np.abs(preds_arr - targets_arr)))
     mse = float(np.mean((preds_arr - targets_arr) ** 2))
     rmse = float(np.sqrt(mse))
-    return total_loss / len(loader.dataset), mae, mse, rmse
+
+    ss_tot = float(np.sum((targets_arr - np.mean(targets_arr)) ** 2))
+    ss_res = float(np.sum((targets_arr - preds_arr) ** 2))
+    r2 = float(1.0 - (ss_res / max(ss_tot, 1e-8)))
+
+    return total_loss / len(loader.dataset), mae, mse, rmse, r2
 
 
-def train_random_forest(
-    data_dir: Path,
-    checkpoints_dir: Path,
-    device: torch.device,
-    image_size: int,
-    norm_mean: float,
-    norm_std: float,
-) -> None:
+def log_experiment(metrics_dir: Path, record: dict) -> None:
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    log_file = metrics_dir / "experiments_log.csv"
+    file_exists = log_file.exists()
 
-    import joblib
-    import pandas as pd
-    from sklearn.ensemble import RandomForestRegressor
+    fieldnames = [
+        "timestamp",
+        "model_type",
+        "backbone",
+        "loss",
+        "lr",
+        "batch_size",
+        "epochs_trained",
+        "best_epoch",
+        "target_normalized",
+        "val_mae_months",
+        "val_rmse_months",
+        "val_r2",
+        "checkpoint_path",
+    ]
 
-    from ml.dataset import (
-        BoneAgeDataset,
-        stratified_split,
-        find_image_directory,
-    )
+    with open(log_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({k: record.get(k, "") for k in fieldnames})
 
-    # ----------------------------
-    # Locate CSV
-    # ----------------------------
-    csv_path = data_dir / "train.csv"
 
-    if not csv_path.exists():
-        csv_path = data_dir / "boneage-training-dataset.csv"
-
-    if not csv_path.exists():
-        raise FileNotFoundError("Training CSV not found.")
-
-    df = pd.read_csv(csv_path)
-
-    # ----------------------------
-    # Locate image folder
-    # ----------------------------
-    image_dir = find_image_directory(data_dir)
-
-    print(f"\nUsing image directory: {image_dir}\n")
-
-    train_df, val_df = stratified_split(df)
-
-    # ----------------------------
-    # Load pretrained CNN
-    # ----------------------------
-    cnn_checkpoint = checkpoints_dir / "cnn_best.pt"
-
-    if not cnn_checkpoint.exists():
-        raise FileNotFoundError(
-            f"Cannot find pretrained CNN:\n{cnn_checkpoint}"
-        )
-
-    print(f"Loading pretrained CNN from {cnn_checkpoint}")
-
-    cnn = CNNFeatureExtractor(pretrained=False)
-
-    checkpoint = torch.load(
-        cnn_checkpoint,
-        map_location=device,
-        weights_only=False,
-    )
-
-    state_dict = checkpoint.get(
-        "model_state_dict",
-        checkpoint,
-    )
-
-    cnn.load_state_dict(
-        state_dict,
-        strict=False,
-    )
-
-    cnn.to(device)
-    cnn.eval()
-
-    # ----------------------------
-    # Feature extraction
-    # ----------------------------
-    def extract_features(subset_df):
-
-        dataset = BoneAgeDataset(
-            subset_df,
-            image_dir,
-            image_size,
-            None,
-            norm_mean,
-            norm_std,
-        )
-
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=32,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True,
-        )
-
-        features = []
-        ages = []
-
-        with torch.no_grad():
-
-            for i, batch in enumerate(loader):
-
-                if i % 50 == 0:
-                    print(
-                        f"Extracting features: batch {i+1}/{len(loader)}"
-                    )
-
-                images = batch["image"].to(device)
-
-                feats = cnn(images)
-
-                feats = feats.cpu().numpy()
-
-                features.append(feats)
-
-                ages.extend(
-                    batch["bone_age"].numpy().tolist()
-                )
-
-        return np.vstack(features), np.array(ages)
-
-    print("\nExtracting training features...")
-    X_train, y_train = extract_features(train_df)
-
-    print("\nExtracting validation features...")
-    X_val, y_val = extract_features(val_df)
-
-    # ----------------------------
-    # Train Random Forest
-    # ----------------------------
-    print("\nTraining Random Forest...")
-    start = time.time()
-
-    rf = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=20,
-        random_state=42,
-        n_jobs=-1,
-    )
-
-    rf.fit(X_train, y_train)
-    print(f"Random Forest training finished in {(time.time()-start)/60:.2f} minutes")
-
-    # ----------------------------
-    # Evaluate
-    # ----------------------------
-    preds = rf.predict(X_val)
-
-    mae = float(np.mean(np.abs(preds - y_val)))
-    mse = float(np.mean((preds - y_val) ** 2))
-    rmse = float(np.sqrt(mse))
-
-    print(f"\nRF Validation")
-    print(f"MAE  : {mae:.2f}")
-    print(f"RMSE : {rmse:.2f}")
-
-    # ----------------------------
-    # Save RF model
-    # ----------------------------
-    rf_dir = BACKEND_ROOT / "rf_models"
-    rf_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    joblib.dump(
-        rf,
-        rf_dir / "cnn_rf.joblib",
-    )
-
-    # ----------------------------
-    # Save combined checkpoint
-    # ----------------------------
-    torch.save(
-        {
-            "model_state_dict": cnn.state_dict(),
-            "model_type": "cnn_rf",
-            "val_mae": mae,
-            "val_rmse": rmse,
-        },
-        checkpoints_dir / "cnn_rf_best.pt",
-    )
-
-    print("\nRandom Forest training completed.")
 def main() -> None:
-
-    # -------------------------
-    # Step 1
-    # -------------------------
-    print("Step 1: Parsing arguments")
     args = parse_args()
-
-    # -------------------------
-    # Step 2
-    # -------------------------
-    print("Step 2: Setting device")
+    set_seed(args.seed)
     device = torch.device(args.device)
 
-    # -------------------------
-    # Step 3
-    # -------------------------
-    print("Step 3: Creating checkpoint directory")
-    args.checkpoints_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    print("=" * 60)
+    print(f"Training Model: {args.model_type}")
+    print(f"Backbone:       {args.backbone}")
+    print(f"Device:         {device}")
+    print(f"Normalize tgt:  {args.normalize_target}")
+    print(f"Pretrained:     {args.pretrained}")
+    print(f"Loss function:  {args.loss}")
+    print("=" * 60)
 
-    # -------------------------
-    # Step 4
-    # -------------------------
-    print("Step 4: Using fixed normalization values")
-
-    norm_mean = 0.4523
-    norm_std = 0.2118
-
-    stats = {
-        "mean": norm_mean,
-        "std": norm_std,
-    }
-
-    save_normalization_stats(
-        stats,
-        args.checkpoints_dir / "normalization.json",
-    )
-
-    print(
-        f"Normalization — mean: {norm_mean:.4f}, std: {norm_std:.4f}"
-    )
-
-    # ======================================================
-    # CNN + Random Forest
-    # Skip CNN training completely
-    # ======================================================
-
-    if args.model_type == "cnn_rf":
-
-        print("\nUsing existing CNN checkpoint (cnn_best.pt)")
-        print("Skipping CNN training...")
-        print("Starting Random Forest training...\n")
-
-        train_random_forest(
-            args.data_dir,
-            args.checkpoints_dir,
-            device,
-            args.image_size,
-            norm_mean,
-            norm_std,
-        )
-
-        print("Training completed successfully!")
-        return
-
-    # -------------------------
-    # Step 5
-    # -------------------------
-    print("Step 5: Creating augmentations")
-
-    augment = TrainAugmentation()
-
-    # -------------------------
-    # Step 6
-    # -------------------------
-    print("Step 6: Creating dataloaders")
-
-    train_loader, val_loader, _, _ = create_dataloaders(
-        args.data_dir,
+    aug = TrainAugmentation()
+    train_loader, val_loader, train_df, val_df, target_mean, target_std = create_dataloaders(
+        data_dir=args.data_dir,
         batch_size=args.batch_size,
         image_size=args.image_size,
-        train_transform=augment,
-        norm_mean=norm_mean,
-        norm_std=norm_std,
+        train_transform=aug,
+        normalize_target=args.normalize_target,
+        seed=args.seed,
     )
 
-    # -------------------------
-    # Step 7
-    # -------------------------
-    print("Step 7: Creating model")
-
-    meta = MODEL_REGISTRY[args.model_type]
-
-    model = meta["class"](
-        pretrained=args.pretrained
-    ).to(device)
-    # -------------------------------------------------
-    # Load pretrained CNN backbone into multimodal model
-    # -------------------------------------------------
-    # -------------------------------------------------
-    # Load pretrained CNN backbone
-    # -------------------------------------------------
-    if args.model_type in ["multimodal_cnn", "cnn_dnn"] and args.cnn_checkpoint is not None:
-
-        print(f"\nLoading pretrained CNN from {args.cnn_checkpoint}")
-
-        checkpoint = torch.load(
-            args.cnn_checkpoint,
-            map_location=device,
-            weights_only=False,
+    print(f"Train samples: {len(train_df)}, Val samples: {len(val_df)}")
+    if args.normalize_target:
+        print(f"Target Normalization -- Mean: {target_mean:.2f} mo, Std: {target_std:.2f} mo")
+        stats_path = args.checkpoints_dir / "normalization_stats.json"
+        save_normalization_stats(
+            {
+                "mean": 0.4523,
+                "std": 0.2118,
+                "target_mean": target_mean,
+                "target_std": target_std,
+            },
+            stats_path,
         )
 
-        state_dict = checkpoint.get(
-            "model_state_dict",
-            checkpoint,
+    # -------------------------------------------------------------
+    # RANDOM FOREST SPECIAL PIPELINE
+    # -------------------------------------------------------------
+    if args.model_type == "cnn_rf":
+        from sklearn.ensemble import RandomForestRegressor
+        import joblib
+
+        print("\n--- Training Random Forest Regressor ---")
+        extractor = CNNFeatureExtractor(pretrained=args.pretrained, backbone_name=args.backbone).to(device)
+
+        if args.cnn_checkpoint and Path(args.cnn_checkpoint).exists():
+            print(f"Loading CNN weights from {args.cnn_checkpoint}")
+            ckpt = torch.load(args.cnn_checkpoint, map_location=device)
+            state = ckpt.get("model_state_dict", ckpt)
+            backbone_state = {k.replace("backbone.", ""): v for k, v in state.items() if k.startswith("backbone.")}
+            if backbone_state:
+                extractor.backbone.load_state_dict(backbone_state, strict=False)
+
+        extractor.eval()
+
+        def extract_features(loader):
+            feats, ys = [], []
+            with torch.no_grad():
+                for batch in loader:
+                    imgs = batch["image"].to(device)
+                    f = extractor(imgs).cpu().numpy()
+                    feats.append(f)
+                    ys.append(batch["target"].numpy())
+            return np.vstack(feats), np.concatenate(ys)
+
+        print("Extracting training features...")
+        X_train, y_train = extract_features(train_loader)
+        print("Extracting validation features...")
+        X_val, y_val = extract_features(val_loader)
+
+        rf = RandomForestRegressor(n_estimators=100, max_depth=15, n_jobs=-1, random_state=args.seed)
+        rf.fit(X_train, y_train)
+
+        val_preds_norm = rf.predict(X_val)
+        if args.normalize_target and target_mean and target_std:
+            val_preds_mo = val_preds_norm * target_std + target_mean
+            val_true_mo = y_val * target_std + target_mean
+        else:
+            val_preds_mo = val_preds_norm
+            val_true_mo = y_val
+
+        mae = float(np.mean(np.abs(val_preds_mo - val_true_mo)))
+        rmse = float(np.sqrt(np.mean((val_preds_mo - val_true_mo) ** 2)))
+        ss_tot = float(np.sum((val_true_mo - np.mean(val_true_mo)) ** 2))
+        r2 = float(1.0 - np.sum((val_true_mo - val_preds_mo) ** 2) / max(ss_tot, 1e-8))
+
+        print(f"\n[CNN_RF Results] Val MAE: {mae:.2f} mo | Val RMSE: {rmse:.2f} mo | Val R2: {r2:.4f}")
+
+        args.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = args.checkpoints_dir / "cnn_rf_best.pth"
+        rf_path = args.checkpoints_dir / "cnn_rf_sklearn.joblib"
+        joblib.dump(rf, rf_path)
+        torch.save({
+            "model_type": "cnn_rf",
+            "backbone": args.backbone,
+            "target_mean": target_mean,
+            "target_std": target_std,
+            "val_mae": mae,
+            "val_rmse": rmse,
+            "val_r2": r2,
+            "rf_path": str(rf_path.name),
+        }, ckpt_path)
+
+        log_experiment(args.metrics_dir, {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model_type": "cnn_rf",
+            "backbone": args.backbone,
+            "loss": "rf_mse",
+            "lr": 0.0,
+            "batch_size": args.batch_size,
+            "epochs_trained": 100,
+            "best_epoch": 1,
+            "target_normalized": args.normalize_target,
+            "val_mae_months": mae,
+            "val_rmse_months": rmse,
+            "val_r2": r2,
+            "checkpoint_path": str(ckpt_path),
+        })
+        return
+
+    # -------------------------------------------------------------
+    # DEEP LEARNING MODELS (cnn, cnn_dnn, multimodal_cnn)
+    # -------------------------------------------------------------
+    model_cls = MODEL_REGISTRY[args.model_type]["class"]
+    if args.model_type in ("cnn", "cnn_dnn", "multimodal_cnn"):
+        model = model_cls(pretrained=args.pretrained, backbone_name=args.backbone).to(device)
+
+    criterion = get_loss_function(args.loss)
+    scaler = GradScaler(enabled=device.type == "cuda")
+
+    # -------------------------------------------------------------
+    # TWO-PHASE TRAINING SCHEDULE
+    # -------------------------------------------------------------
+    # Phase 1: Warmup head with frozen backbone
+    warmup_epochs = min(args.warmup_epochs, args.epochs // 4)
+    backbone_module = getattr(model, "backbone", getattr(model, "image_backbone", None))
+
+    if warmup_epochs > 0 and backbone_module is not None:
+        print(f"\n--- Phase 1: Warming up head for {warmup_epochs} epochs (backbone frozen) ---")
+        for param in backbone_module.parameters():
+            param.requires_grad = False
+
+        warmup_opt = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
         )
 
-        backbone_state = {}
+        for ep in range(1, warmup_epochs + 1):
+            t_loss = train_epoch(model, train_loader, warmup_opt, criterion, device, args.model_type, scaler)
+            v_loss, v_mae, v_mse, v_rmse, v_r2 = validate(
+                model, val_loader, criterion, device, args.model_type, target_mean, target_std
+            )
+            print(f"Warmup [{ep}/{warmup_epochs}] Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | Val MAE: {v_mae:.2f} mo | Val R2: {v_r2:.4f}")
 
-        # Extract only backbone weights
-        for key, value in state_dict.items():
+    # Phase 2: Full fine-tuning with differential learning rates
+    print("\n--- Phase 2: Full End-to-End Fine-Tuning (differential LR) ---")
+    if backbone_module is not None:
+        for param in backbone_module.parameters():
+            param.requires_grad = True
 
-            if key.startswith("backbone."):
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_module.parameters(), "lr": args.lr * 0.1},
+            {"params": [p for n, p in model.named_parameters() if not n.startswith("backbone") and not n.startswith("image_backbone")], "lr": args.lr},
+        ], weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-                if args.model_type == "multimodal_cnn":
-                    new_key = key.replace(
-                        "backbone.",
-                        "image_backbone."
-                    )
-                else:
-                    new_key = key
-
-                backbone_state[new_key] = value
-
-        # Load ONLY ONCE
-        missing, unexpected = model.load_state_dict(
-            backbone_state,
-            strict=False,
-        )
-
-        print("CNN backbone loaded successfully!")
-
-        # Freeze backbone
-        if args.model_type == "multimodal_cnn":
-            for p in model.image_backbone.parameters():
-                p.requires_grad = False
-
-        elif args.model_type == "cnn_dnn":
-            for p in model.backbone.parameters():
-                p.requires_grad = False
-
-    # -------------------------
-    # Step 8
-    # -------------------------
-    print("Step 8: Creating optimizer")
-
-    criterion = nn.SmoothL1Loss()
-
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=1e-4
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, verbose=True
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-    )
-
-    scaler = GradScaler(
-        enabled=device.type == "cuda"
-    )
-
-    best_mae = float("inf")
+    best_val_mae = float("inf")
+    best_epoch = 0
     patience_counter = 0
-    history = []
-
-    # -------------------------
-    # Step 9
-    # -------------------------
-    print("Step 9: Starting training")
+    args.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = args.checkpoints_dir / f"{args.model_type}_best.pth"
 
     for epoch in range(1, args.epochs + 1):
-
-        print(f"\n========== Epoch {epoch}/{args.epochs} ==========")
-
-        train_loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-            args.model_type,
-            scaler,
+        t0 = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, args.model_type, scaler)
+        val_loss, val_mae, val_mse, val_rmse, val_r2 = validate(
+            model, val_loader, criterion, device, args.model_type, target_mean, target_std
         )
-
-        val_loss, mae, mse, rmse = validate(
-            model,
-            val_loader,
-            criterion,
-            device,
-            args.model_type,
-        )
-
-        scheduler.step()
-
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "mae": mae,
-                "mse": mse,
-                "rmse": rmse,
-            }
-        )
+        scheduler.step(val_mae)
+        elapsed = time.time() - t0
 
         print(
-            f"Epoch {epoch}/{args.epochs} — "
-            f"train_loss={train_loss:.4f} | "
-            f"val_mae={mae:.2f} | "
-            f"val_rmse={rmse:.2f}"
+            f"Epoch [{epoch:02d}/{args.epochs:02d}] ({elapsed:.1f}s) -- "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Val MAE: {val_mae:.2f} mo | Val RMSE: {val_rmse:.2f} mo | Val R2: {val_r2:.4f}"
         )
 
-        if mae < best_mae:
-
-            best_mae = mae
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            best_epoch = epoch
             patience_counter = 0
-
-            ckpt_name = f"{args.model_type}_best.pt"
-
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "model_type": args.model_type,
-                    "val_mae": mae,
-                    "val_mse": mse,
-                    "val_rmse": rmse,
-                    "norm_mean": norm_mean,
-                    "norm_std": norm_std,
-                },
-                args.checkpoints_dir / ckpt_name,
-            )
-
-            print(f"Saved checkpoint: {ckpt_name}")
-
+            torch.save({
+                "epoch": epoch,
+                "model_type": args.model_type,
+                "backbone": args.backbone,
+                "model_state_dict": model.state_dict(),
+                "val_mae": val_mae,
+                "val_rmse": val_rmse,
+                "val_r2": val_r2,
+                "target_mean": target_mean,
+                "target_std": target_std,
+            }, best_ckpt_path)
+            print(f"  * Saved new best checkpoint with Val MAE = {val_mae:.2f} months")
         else:
-
             patience_counter += 1
-
             if patience_counter >= args.patience:
-                print("Early stopping triggered")
+                print(f"\n[Early Stopping] No improvement for {args.patience} epochs. Stopping at epoch {epoch}.")
                 break
 
-    # -------------------------
-    # Step 10
-    # -------------------------
-    print("Step 10: Saving history")
+    print("\n" + "=" * 60)
+    print(f"Training Complete for {args.model_type}!")
+    print(f"Best Val MAE: {best_val_mae:.2f} months at epoch {best_epoch}")
+    print(f"Best Checkpoint: {best_ckpt_path}")
+    print("=" * 60)
 
-    history_path = (
-        args.checkpoints_dir
-        / f"{args.model_type}_history.json"
-    )
+    log_experiment(args.metrics_dir, {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model_type": args.model_type,
+        "backbone": args.backbone,
+        "loss": args.loss,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "epochs_trained": epoch,
+        "best_epoch": best_epoch,
+        "target_normalized": args.normalize_target,
+        "val_mae_months": best_val_mae,
+        "val_rmse_months": val_rmse,
+        "val_r2": val_r2,
+        "checkpoint_path": str(best_ckpt_path),
+    })
 
-    with open(
-        history_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
 
-        json.dump(
-            history,
-            f,
-            indent=2,
-        )
-
-    print("Training completed successfully!")
 if __name__ == "__main__":
     main()

@@ -5,6 +5,9 @@ from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -20,6 +23,10 @@ class Settings(BaseSettings):
     metrics_dir: Path = Path("metrics")
     upload_dir: Path = Path("uploads")
     rf_models_dir: Path = Path("rf_models")
+    checkpoint_dir: Path = BACKEND_ROOT / "checkpoints"
+    metrics_dir: Path = BACKEND_ROOT / "metrics"
+    upload_dir: Path = BACKEND_ROOT / "uploads"
+    rf_models_dir: Path = BACKEND_ROOT / "rf_models"
 
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 

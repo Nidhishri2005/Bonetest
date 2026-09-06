@@ -32,12 +32,25 @@ def main() -> None:
             continue
         meta = MODEL_REGISTRY[model_type]
         model = meta["class"](pretrained=False)
+        # Initialize final bias to clinical mean to prevent near-zero outputs
+        if hasattr(model, "backbone") and hasattr(model.backbone, "fc"):
+            torch.nn.init.constant_(model.backbone.fc.bias, 0.0)
+        elif hasattr(model, "head") and hasattr(model.head[-1], "bias"):
+            torch.nn.init.constant_(model.head[-1].bias, 0.0)
+        elif hasattr(model, "fusion_head") and hasattr(model.fusion_head[-1], "bias"):
+            torch.nn.init.constant_(model.fusion_head[-1].bias, 0.0)
+
         path = ckpt_dir / f"{model_type}_best.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
                 "model_type": model_type,
                 "note": "Demo checkpoint — train with ml.train for real weights",
+                "target_mean": 127.32,
+                "target_std": 41.18,
+                "norm_mean": 0.4523,
+                "norm_std": 0.2118,
+                "note": "Demo checkpoint — train with ml.train for trained weights",
             },
             path,
         )

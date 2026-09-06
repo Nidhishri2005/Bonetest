@@ -25,11 +25,17 @@ MODEL_RMSE: dict[str, float] = {
 def _compute_confidence(prediction: float, model_type: str) -> float:
     rmse = MODEL_RMSE.get(model_type, 10.0)
     # Higher confidence when prediction is within typical pediatric range
+    rmse = MODEL_RMSE.get(model_type, 11.5)
+    # Higher confidence when prediction is within typical pediatric range (1-228 months)
     range_penalty = 0.0
     if prediction < 12 or prediction > 228:
         range_penalty = 0.15
     base = max(0.0, 1.0 - rmse / 20.0)
     return float(np.clip(base - range_penalty, 0.55, 0.98))
+    if prediction < 1 or prediction > 228:
+        range_penalty = 0.20
+    base = max(0.0, 1.0 - rmse / 25.0)
+    return float(np.clip(base - range_penalty, 0.50, 0.98))
 
 
 class InferenceService:
@@ -58,8 +64,14 @@ class InferenceService:
                     [[gender_val]], device=self.registry.device, dtype=tensor.dtype
                 )
                 pred = model(tensor, gender_tensor).item()
+                target_mean, target_std = self.registry.get_target_scaler(model_type)
+                if target_mean is not None and target_std is not None:
+                    pred = pred * target_std + target_mean
             else:
                 pred = model(tensor).item()
+                target_mean, target_std = self.registry.get_target_scaler(model_type)
+                if target_mean is not None and target_std is not None:
+                    pred = pred * target_std + target_mean
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         confidence = _compute_confidence(pred, model_type)
