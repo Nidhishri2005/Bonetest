@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
@@ -30,6 +29,20 @@ from app.models.cnn_rf import CNNFeatureExtractor, CNNWithRFWrapper
 from ml.augmentation import TrainAugmentation
 from ml.dataset import create_dataloaders
 from ml.preprocessing import compute_dataset_statistics, save_normalization_stats
+
+
+def get_autocast(device: torch.device):
+    """Context manager for automatic mixed precision across PyTorch versions."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device.type, enabled=device.type == "cuda")
+    return torch.cuda.amp.autocast(enabled=device.type == "cuda")
+
+
+def get_scaler(device: torch.device):
+    """GradScaler instance across PyTorch versions."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
+    return torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
 
 def set_seed(seed: int = 42) -> None:
@@ -116,7 +129,7 @@ def train_epoch(model, loader, optimizer, criterion, device, model_type, scaler)
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=device.type == "cuda"):
+        with get_autocast(device):
             if model_type == "multimodal_cnn":
                 gender = batch["male"].unsqueeze(-1).to(device)
                 outputs = model(images, gender)
@@ -338,7 +351,13 @@ def main() -> None:
         model = model_cls(pretrained=args.pretrained, backbone_name=args.backbone).to(device)
 
     criterion = get_loss_function(args.loss)
-    scaler = GradScaler(enabled=device.type == "cuda")
+    scaler = get_scaler(device)
+
+    best_val_mae = float("inf")
+    best_epoch = 0
+    patience_counter = 0
+    args.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = args.checkpoints_dir / f"{args.model_type}_best.pth"
 
     # -------------------------------------------------------------
     # TWO-PHASE TRAINING SCHEDULE
@@ -364,6 +383,21 @@ def main() -> None:
                 model, val_loader, criterion, device, args.model_type, target_mean, target_std
             )
             print(f"Warmup [{ep}/{warmup_epochs}] Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | Val MAE: {v_mae:.2f} mo | Val R2: {v_r2:.4f}")
+            if v_mae < best_val_mae:
+                best_val_mae = v_mae
+                best_epoch = ep
+                torch.save({
+                    "epoch": ep,
+                    "model_type": args.model_type,
+                    "backbone": args.backbone,
+                    "model_state_dict": model.state_dict(),
+                    "val_mae": v_mae,
+                    "val_rmse": v_rmse,
+                    "val_r2": v_r2,
+                    "target_mean": target_mean,
+                    "target_std": target_std,
+                }, best_ckpt_path)
+                print(f"  * Saved new best checkpoint with Val MAE = {v_mae:.2f} months")
 
     # Phase 2: Full fine-tuning with differential learning rates
     print("\n--- Phase 2: Full End-to-End Fine-Tuning (differential LR) ---")
@@ -379,14 +413,8 @@ def main() -> None:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, verbose=True
+        optimizer, mode="min", factor=0.5, patience=2
     )
-
-    best_val_mae = float("inf")
-    best_epoch = 0
-    patience_counter = 0
-    args.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt_path = args.checkpoints_dir / f"{args.model_type}_best.pth"
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -394,7 +422,13 @@ def main() -> None:
         val_loss, val_mae, val_mse, val_rmse, val_r2 = validate(
             model, val_loader, criterion, device, args.model_type, target_mean, target_std
         )
+        
+        old_lr = optimizer.param_groups[-1]["lr"]
         scheduler.step(val_mae)
+        new_lr = optimizer.param_groups[-1]["lr"]
+        if new_lr < old_lr:
+            print(f"  * Learning rate adjusted: {old_lr:.2e} -> {new_lr:.2e}")
+
         elapsed = time.time() - t0
 
         print(
