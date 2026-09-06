@@ -137,11 +137,14 @@ def stratified_split(
 def find_image_directory(data_dir: Path) -> Path:
     """Automatically locate the RSNA training image folder."""
     data_dir = Path(data_dir)
+    if data_dir.is_file():
+        data_dir = data_dir.parent
 
     possible_dirs = [
         data_dir / "boneage-training-dataset" / "boneage-training-dataset",
         data_dir / "boneage-training-dataset",
         data_dir / "train",
+        data_dir / "images",
         data_dir,
     ]
 
@@ -150,6 +153,13 @@ def find_image_directory(data_dir: Path) -> Path:
             has_images = any(d.glob("*.png")) or any(d.glob("*.jpg")) or any(d.glob("*.jpeg"))
             if has_images:
                 return d
+
+    # Deep search for any directory with radiograph images
+    if data_dir.exists() and data_dir.is_dir():
+        for sub in data_dir.glob("**/"):
+            if sub.is_dir():
+                if any(sub.glob("*.png")) or any(sub.glob("*.jpg")):
+                    return sub
 
     raise FileNotFoundError(f"Could not locate RSNA images in {data_dir}")
 
@@ -168,21 +178,29 @@ def create_dataloaders(
     seed: int = 42,
 ):
     data_dir = Path(data_dir)
+    if data_dir.is_file() and data_dir.suffix.lower() == ".csv":
+        csv_path = data_dir
+        data_dir = data_dir.parent
+    else:
+        possible_csv = [
+            data_dir / "boneage-training-dataset.csv",
+            data_dir / "train.csv",
+            data_dir / csv_name,
+        ]
+        csv_path = None
+        for p in possible_csv:
+            if p.exists() and p.is_file():
+                csv_path = p
+                break
 
-    possible_csv = [
-        data_dir / "boneage-training-dataset.csv",
-        data_dir / "train.csv",
-        data_dir / csv_name,
-    ]
+        if csv_path is None and data_dir.exists():
+            for p in data_dir.glob("**/*.csv"):
+                if "boneage" in p.name.lower() or "train" in p.name.lower():
+                    csv_path = p
+                    break
 
-    csv_path = None
-    for p in possible_csv:
-        if p.exists():
-            csv_path = p
-            break
-
-    if csv_path is None:
-        raise FileNotFoundError(f"No training CSV found in {data_dir}")
+    if csv_path is None or not csv_path.exists():
+        raise FileNotFoundError(f"No training CSV found in {data_dir}. Please check your dataset path.")
 
     df = pd.read_csv(csv_path)
     image_dir = find_image_directory(data_dir)
